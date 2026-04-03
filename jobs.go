@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -43,6 +45,35 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 	if err == nil && taskProcessor != nil {
 		defer taskProcessor.Close()
 		taskProcessor.SetLogger(jobLogger)
+
+		// Before transcoding, check if this original file was already processed
+		// and uploaded in a previous job. Strategy:
+		//   1. Compute SHA1 of the original file (cheap, no transcoding yet)
+		//   2. Look up the known fake (processed) hash via the reverse map
+		//   3. Ask Immich directly whether an asset with that fake hash exists
+		//      - "reject" (duplicate) → already on server, skip entirely
+		//      - "accept"             → not on server (e.g. deleted), proceed normally
+		// This breaks the retry loop that causes UQ_assets_owner_checksum errors
+		// and blocks the upload queue during long batch jobs.
+		earlyOriginalHash, hashErr := SHA1(taskProcessor.OriginalFile)
+		if hashErr == nil {
+			mapLock.RLock()
+			fakeHash, known := originalToFakeChecksum[earlyOriginalHash]
+			mapLock.RUnlock()
+			if known {
+				alreadyUploaded, checkErr := checkAssetExistsUpstream(r, fakeHash)
+				if checkErr != nil {
+					jobLogger.Printf("bulk-upload-check failed (continuing normally): %v", checkErr)
+				} else if alreadyUploaded {
+					jobLogger.Printf("skipping already uploaded asset (confirmed by Immich): %s", jobKey)
+					w.WriteHeader(http.StatusOK)
+					return nil
+				}
+			}
+		} else {
+			jobLogger.Printf("early SHA1 failed (continuing normally): %v", hashErr)
+		}
+
 		// Delete multipart file before running command. Saves RAM (tmpfs)
 		_ = formFile.Close()
 		_ = r.MultipartForm.RemoveAll()
@@ -79,6 +110,58 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 	}
 
 	return nil
+}
+
+// checkAssetExistsUpstream calls Immich's bulk-upload-check endpoint to
+// determine whether an asset with the given checksum already exists on the
+// server. It reuses the auth headers from the original upload request so no
+// separate API key configuration is needed.
+// Returns true when Immich responds with action="reject" (i.e. duplicate).
+func checkAssetExistsUpstream(r *http.Request, checksum string) (bool, error) {
+	body, err := json.Marshal(map[string]any{
+		"assets": []map[string]any{
+			{"id": "iuo-check", "checksum": checksum},
+		},
+	})
+	if err != nil {
+		return false, fmt.Errorf("marshal bulk-upload-check body: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, upstreamURL+"/api/assets/bulk-upload-check", bytes.NewReader(body))
+	if err != nil {
+		return false, fmt.Errorf("create bulk-upload-check request: %w", err)
+	}
+	// Forward auth headers from the original request (e.g. x-api-key, Authorization)
+	for _, h := range []string{"Authorization", "x-api-key", "Cookie"} {
+		if v := r.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := getHTTPclient().Do(req)
+	if err != nil {
+		return false, fmt.Errorf("bulk-upload-check request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("bulk-upload-check returned HTTP %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Results []struct {
+			Action string `json:"action"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, fmt.Errorf("decode bulk-upload-check response: %w", err)
+	}
+	if len(result.Results) == 0 {
+		return false, nil
+	}
+	return result.Results[0].Action == "reject", nil
 }
 
 func uploadUpstream(w http.ResponseWriter, r *http.Request, file io.ReadSeeker, name string) (err error) {

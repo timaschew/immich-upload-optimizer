@@ -30,9 +30,11 @@ func SHA1(file io.ReadSeeker) (string, error) {
 
 var mapLock sync.RWMutex
 var fakeToOriginalChecksum map[string]string
+var originalToFakeChecksum map[string]string // reverse map: original hash → fake hash
 
 func initChecksums() {
 	fakeToOriginalChecksum = make(map[string]string)
+	originalToFakeChecksum = make(map[string]string)
 	file, err := os.OpenFile(checksumsFile, os.O_CREATE|os.O_RDONLY, 0644)
 	if err != nil {
 		return
@@ -41,7 +43,11 @@ func initChecksums() {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		kv := strings.Split(scanner.Text(), ",")
+		if len(kv) != 2 {
+			continue
+		}
 		fakeToOriginalChecksum[kv[0]] = kv[1]
+		originalToFakeChecksum[kv[1]] = kv[0] // populate reverse map on startup
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Println("Error reading csv:", err)
@@ -52,6 +58,7 @@ func addChecksums(fake, original string) {
 	go func() {
 		mapLock.Lock()
 		fakeToOriginalChecksum[fake] = original
+		originalToFakeChecksum[original] = fake // keep reverse map in sync
 		mapLock.Unlock()
 		_ = appendToCSV(fake, original)
 	}()

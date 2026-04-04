@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
@@ -30,9 +31,11 @@ func SHA1(file io.ReadSeeker) (string, error) {
 
 var mapLock sync.RWMutex
 var fakeToOriginalChecksum map[string]string
+var originalToFakeChecksum map[string]string
 
 func initChecksums() {
 	fakeToOriginalChecksum = make(map[string]string)
+	originalToFakeChecksum = make(map[string]string)
 	file, err := os.OpenFile(checksumsFile, os.O_CREATE|os.O_RDONLY, 0644)
 	if err != nil {
 		return
@@ -42,6 +45,7 @@ func initChecksums() {
 	for scanner.Scan() {
 		kv := strings.Split(scanner.Text(), ",")
 		fakeToOriginalChecksum[kv[0]] = kv[1]
+		originalToFakeChecksum[kv[1]] = kv[0]
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Println("Error reading csv:", err)
@@ -52,9 +56,72 @@ func addChecksums(fake, original string) {
 	go func() {
 		mapLock.Lock()
 		fakeToOriginalChecksum[fake] = original
+		originalToFakeChecksum[original] = fake
 		mapLock.Unlock()
 		_ = appendToCSV(fake, original)
 	}()
+}
+
+func checkBulkUpload(checksum string, r *http.Request) (exists bool, assetId string, err error) {
+	type checkItem struct {
+		ID       string `json:"id"`
+		Checksum string `json:"checksum"`
+	}
+	type checkRequest struct {
+		Assets []checkItem `json:"assets"`
+	}
+
+	reqBody, err := json.Marshal(checkRequest{
+		Assets: []checkItem{{ID: "check", Checksum: checksum}},
+	})
+	if err != nil {
+		return false, "", err
+	}
+
+	req, err := http.NewRequest("POST", upstreamURL+"/api/assets/bulk-upload-check", bytes.NewReader(reqBody))
+	if err != nil {
+		return false, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for _, key := range []string{"Authorization", "Cookie", "x-api-key"} {
+		if v := r.Header.Get(key); v != "" {
+			req.Header.Set(key, v)
+		}
+	}
+
+	resp, err := getHTTPclient().Do(req)
+	if err != nil {
+		return false, "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, "", err
+	}
+
+	var result struct {
+		Results []struct {
+			Action  string `json:"action"`
+			AssetId string `json:"assetId"`
+		} `json:"results"`
+	}
+	if err = json.Unmarshal(body, &result); err != nil {
+		return false, "", err
+	}
+
+	if len(result.Results) > 0 && result.Results[0].Action == "reject" {
+		return true, result.Results[0].AssetId, nil
+	}
+	return false, "", nil
+}
+
+// reverseLookupChecksum finds the fake checksum for a given original checksum in O(1).
+func reverseLookupChecksum(original string) (string, bool) {
+	mapLock.RLock()
+	defer mapLock.RUnlock()
+	fake, found := originalToFakeChecksum[original]
+	return fake, found
 }
 
 func appendToCSV(key, value string) error {

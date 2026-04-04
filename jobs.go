@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -33,8 +34,37 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 	jobs.Store(jobKey, jobID)
 	defer jobs.Delete(jobKey)
 
+	// Step 1: Compute SHA1 of original file and check with Immich BEFORE any processing
+	originalChecksum, sha1Err := SHA1(formFile)
+	if sha1Err != nil {
+		jobLogger.Printf("sha1 for bulk upload check failed: %s, proceeding", sha1Err.Error())
+	} else {
+		checksumToCheck := originalChecksum
+		if fakeChecksum, found := reverseLookupChecksum(originalChecksum); found {
+			checksumToCheck = fakeChecksum
+		}
+		alreadyExists, assetId, checkErr := checkBulkUpload(checksumToCheck, r)
+		if checkErr != nil {
+			jobLogger.Printf("bulk upload check failed: %s, proceeding", checkErr.Error())
+		} else if alreadyExists {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":        assetId,
+				"duplicate": true,
+				"status":    "duplicate",
+			})
+			jobLogger.Printf("skipped (already in Immich): \"%s\"", formFileHeader.Filename)
+			return nil
+		}
+	}
+	// Reset file position after SHA1 computation
+	if _, err = formFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("unable to seek beginning of file: %w", err)
+	}
+
+	// Step 2: Process file if a matching task exists
 	var originalHash string
-	var newHash string
 	uploadFile := formFile
 	uploadFilename := formFileHeader.Filename
 	uploadOriginal := true
@@ -62,7 +92,8 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 			_ = taskProcessor.CleanOriginalFile() // Save RAM before upload (tmpfs)
 		}
 	}
-	// Upload the original file or processed one if a task was found
+
+	// Step 3: Upload the original file or processed one
 	err = uploadUpstream(w, r, uploadFile, uploadFilename)
 	if err != nil {
 		jobLogger.Printf("upload upstream error: %s", err.Error())
@@ -71,10 +102,11 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 	if uploadOriginal {
 		jobLogger.Printf("uploaded original: \"%s\" (%s)", formFileHeader.Filename, humanReadableSize(formFileHeader.Size))
 	} else {
-		if newHash, err = SHA1(taskProcessor.ProcessedFile); err != nil {
+		if newHash, err := SHA1(taskProcessor.ProcessedFile); err != nil {
 			return fmt.Errorf("new sha1: %w", err)
+		} else {
+			addChecksums(newHash, originalHash)
 		}
-		addChecksums(newHash, originalHash)
 		jobLogger.Printf("uploaded: \"%s\" (%s) <- (%s) \"%s\"", taskProcessor.ProcessedFilename, humanReadableSize(taskProcessor.ProcessedSize), humanReadableSize(taskProcessor.OriginalSize), taskProcessor.OriginalFilename)
 	}
 

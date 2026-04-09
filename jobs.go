@@ -101,7 +101,7 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 			if hj, ok := w.(http.Hijacker); ok {
 				conn, bufrw, err := hj.Hijack()
 				if err == nil {
-					_, _ = bufrw.WriteString("HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nIUO is already processing this asset\r\n")
+					_, _ = bufrw.WriteString("HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nIUO is already processing this asset\r\n")
 					_ = bufrw.Flush()
 					if tcpConn, ok := conn.(*net.TCPConn); ok {
 						tcpConn.CloseWrite()
@@ -187,7 +187,7 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 	// Upload the original file or processed one if a task was found
 	err = uploadUpstream(w, r, uploadFile, uploadFilename, formValues)
 	if err != nil {
-		http.Error(w, "failed to process file, view IUO logs for more info", http.StatusInternalServerError)
+		http.Error(w, "failed to process file, view IUO logs for more info", http.StatusConflict)
 		return fmt.Errorf("job %d: upload upstream: %w", jobID, err)
 	}
 	if uploadOriginal {

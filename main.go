@@ -147,6 +147,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		logger.SetErrPrefix("job err")
 		logger.Error(err, "")
 		return
+	case isBulkUploadCheck(r):
+		if err = replaceBulkUploadCheck(w, r, logger); err == nil {
+			return
+		}
 	default:
 		if replacer := getChecksumReplacer(w, r, logger); replacer != nil {
 			logger.SetErrPrefix(fmt.Sprintf("replacer %d", replacer.typeId))

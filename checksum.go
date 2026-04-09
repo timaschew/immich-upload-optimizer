@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,9 +32,11 @@ func SHA1(file io.ReadSeeker) (string, error) {
 
 var mapLock sync.RWMutex
 var fakeToOriginalChecksum map[string]string
+var originalToFakeChecksum map[string]string
 
 func initChecksums() {
 	fakeToOriginalChecksum = make(map[string]string)
+	originalToFakeChecksum = make(map[string]string)
 	file, err := os.OpenFile(checksumsFile, os.O_CREATE|os.O_RDONLY, 0644)
 	if err != nil {
 		return
@@ -42,6 +46,7 @@ func initChecksums() {
 	for scanner.Scan() {
 		kv := strings.Split(scanner.Text(), ",")
 		fakeToOriginalChecksum[kv[0]] = kv[1]
+		originalToFakeChecksum[kv[1]] = kv[0]
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Println(red("Error reading csv: %v", err))
@@ -52,6 +57,7 @@ func addChecksums(fake, original string) {
 	go func() {
 		mapLock.Lock()
 		fakeToOriginalChecksum[fake] = original
+		originalToFakeChecksum[original] = fake
 		mapLock.Unlock()
 		_ = appendToCSV(fake, original)
 	}()
@@ -91,6 +97,58 @@ func (asset Asset) toOriginalAsset() {
 			}
 		}
 	}
+}
+
+type bulkUploadCheckItem struct {
+	ID       string `json:"id"`
+	Checksum string `json:"checksum"`
+}
+
+type bulkUploadCheckRequest struct {
+	Assets []bulkUploadCheckItem `json:"assets"`
+}
+
+func replaceBulkUploadCheck(w http.ResponseWriter, r *http.Request, logger *customLogger) error {
+	logger.SetErrPrefix("bulk-upload-check")
+	var err error
+	var bodyBytes []byte
+	if bodyBytes, err = io.ReadAll(r.Body); logger.Error(err, "read body") {
+		return err
+	}
+	var checkReq bulkUploadCheckRequest
+	if err = json.Unmarshal(bodyBytes, &checkReq); logger.Error(err, "json unmarshal") {
+		return err
+	}
+	mapLock.RLock()
+	for i, asset := range checkReq.Assets {
+		key := asset.Checksum
+		if raw, err := hex.DecodeString(key); err == nil && len(raw) == sha1.Size {
+			key = base64.StdEncoding.EncodeToString(raw)
+		}
+		if fake, ok := originalToFakeChecksum[key]; ok {
+			checkReq.Assets[i].Checksum = fake
+		}
+	}
+	mapLock.RUnlock()
+	if bodyBytes, err = json.Marshal(checkReq); logger.Error(err, "json marshal") {
+		return err
+	}
+	var req *http.Request
+	if req, err = http.NewRequest(r.Method, upstreamURL+r.URL.String(), bytes.NewReader(bodyBytes)); logger.Error(err, "new request") {
+		return err
+	}
+	req.Header = r.Header
+	var resp *http.Response
+	if resp, err = getHTTPclient().Do(req); logger.Error(err, "getHTTPclient.Do") {
+		return err
+	}
+	defer resp.Body.Close()
+	setHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if _, err = io.Copy(w, resp.Body); logger.Error(err, "resp write") {
+		return err
+	}
+	return nil
 }
 
 func getChecksumReplacer(w http.ResponseWriter, r *http.Request, logger *customLogger) *Replacer {
@@ -142,7 +200,7 @@ func (replacer Replacer) Replace() (err error) {
 	w, r, logger := replacer.w, replacer.r, replacer.logger
 	var req *http.Request
 	var resp *http.Response
-	if req, err = http.NewRequest(r.Method, upstreamURL+r.URL.String(), nil); logger.Error(err, "new POST") {
+	if req, err = http.NewRequest(r.Method, upstreamURL+r.URL.String(), nil); logger.Error(err, "new request") {
 		return
 	}
 	req.Header = r.Header

@@ -16,8 +16,6 @@ import (
 	"github.com/andybalholm/brotli"
 )
 
-var filterFormKey = "assetData"
-
 // All images accepted by immich: https://github.com/immich-app/immich/blob/main/server/src/utils/mime-types.ts
 var imageExtensions = []string{"3fr", "ari", "arw", "cap", "cin", "cr2", "cr3", "crw", "dcr", "dng", "erf", "fff", "iiq", "k25", "kdc", "mrw", "nef", "nrw", "orf", "ori", "pef", "psd", "raf", "raw", "rw2", "rwl", "sr2", "srf", "srw", "x3f", "avif", "gif", "jpeg", "jpg", "png", "webp", "bmp", "heic", "heif", "hif", "insp", "jp2", "jpe", "jxl", "svg", "tif", "tiff"}
 

@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"io"
-	"mime/multipart"
 	"os"
 	"os/exec"
 	"path"
@@ -32,8 +30,8 @@ type TaskProcessor struct {
 	logger *customLogger
 }
 
-func NewTaskProcessorFromMultipart(file multipart.File, header *multipart.FileHeader) (*TaskProcessor, error) {
-	originalExtension := path.Ext(header.Filename)
+func NewTaskProcessor(file *os.File, fileName string, fileSize int64) (*TaskProcessor, error) {
+	originalExtension := path.Ext(fileName)
 	if !isValidFilename(originalExtension) {
 		return nil, fmt.Errorf("invalid file extension: %s", originalExtension)
 	}
@@ -51,27 +49,17 @@ func NewTaskProcessorFromMultipart(file multipart.File, header *multipart.FileHe
 		return nil, fmt.Errorf("no task found for file extension .%s", checkExt)
 	}
 
-	if header.Size < task.MinFilesizeBytes {
-		return nil, fmt.Errorf("file size is smaller than minimum: %d < %d", header.Size, task.MinFilesizeBytes)
-	}
-
-	originalFile, err := os.CreateTemp("", "upload-*"+originalExtension)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create temp file: %w", err)
-	}
-
-	_, err = io.Copy(originalFile, file)
-	if err != nil {
-		return nil, fmt.Errorf("unable to write temp file: %w", err)
+	if fileSize < task.MinFilesizeBytes {
+		return nil, fmt.Errorf("file size is smaller than minimum: %d < %d", fileSize, task.MinFilesizeBytes)
 	}
 
 	return &TaskProcessor{
 		Task:                 task,
-		OriginalFile:         originalFile,
-		OriginalFilename:     header.Filename,
+		OriginalFile:         file,
+		OriginalFilename:     fileName,
 		OriginalExtension:    originalExtension,
-		OriginalSize:         header.Size,
-		tempOriginalFilePath: originalFile.Name(),
+		OriginalSize:         fileSize,
+		tempOriginalFilePath: file.Name(),
 	}, nil
 }
 

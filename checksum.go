@@ -45,21 +45,40 @@ func initChecksums() {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		kv := strings.Split(scanner.Text(), ",")
-		fakeToOriginalChecksum[kv[0]] = kv[1]
-		originalToFakeChecksum[kv[1]] = kv[0]
+		setChecksumPair(kv[0], kv[1])
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Println(red("Error reading csv: %v", err))
 	}
 }
 
+// setChecksumPair ensures a fake<->original 1:1 relationship. Caller must hold mapLock.
+func setChecksumPair(fake, original string) bool {
+	if existingOriginal, ok := fakeToOriginalChecksum[fake]; ok && existingOriginal == original {
+		fmt.Println(magenta("Duplicate checksum pair: %s <-> %s", fake, original))
+		return false
+	}
+	if oldOriginal, ok := fakeToOriginalChecksum[fake]; ok && oldOriginal != original {
+		fmt.Println(red("Duplicate fake checksum: %s -> %s , %s", fake, oldOriginal, original))
+		delete(originalToFakeChecksum, oldOriginal)
+	}
+	if oldFake, ok := originalToFakeChecksum[original]; ok && oldFake != fake {
+		fmt.Println(red("Duplicate orig checksum: %s -> %s , %s", original, oldFake, fake))
+		delete(fakeToOriginalChecksum, oldFake)
+	}
+	fakeToOriginalChecksum[fake] = original
+	originalToFakeChecksum[original] = fake
+	return true
+}
+
 func addChecksums(fake, original string) {
 	go func() {
 		mapLock.Lock()
-		fakeToOriginalChecksum[fake] = original
-		originalToFakeChecksum[original] = fake
+		changed := setChecksumPair(fake, original)
 		mapLock.Unlock()
-		_ = appendToCSV(fake, original)
+		if changed {
+			_ = appendToCSV(fake, original)
+		}
 	}()
 }
 

@@ -84,6 +84,7 @@ All flags are also available as environment variables using the prefix `IUO_` fo
 - `-download_jpg_from_avif`: Converts AVIF images to JPG on download for compatibility (default: `false`)
 - `-max_image_jobs`: Max number of image jobs running concurrently (default: `5`)
 - `-max_video_jobs`: Max number of video jobs running concurrently (default: `1`)
+- `-force_colors`: Force colored log output even in non-TTY environments like Docker (default: `true`)
 
 ## 📸 Images
 **[AVIF](https://aomediacodec.github.io/av1-avif/)** is used by default, saving **~80%** space while maintaining the same perceived quality (lossy conversion)

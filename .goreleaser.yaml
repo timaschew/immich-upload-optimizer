@@ -1,85 +1,44 @@
 version: 2
+
 before:
   hooks:
     - go generate ./...
     - go mod tidy
+
 builds:
   - env:
       - CGO_ENABLED=0
     goos:
       - darwin
       - linux
-      - windows
     goarch:
-      - 386
       - amd64
-      - arm
-      - arm64
-    goarm:
-      - 7
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}}
+
 dockers:
-  -
-    goos: linux
+  - goos: linux
     goarch: amd64
     image_templates:
-    - "ghcr.io/joojoooo/{{.ProjectName}}:{{ .Tag }}-amd64"
-    dockerfile: 'Dockerfile.goreleaser'
+      - "ghcr.io/timaschew/{{.ProjectName}}:{{ .Tag }}"
+      - "ghcr.io/timaschew/{{.ProjectName}}:latest"
+    dockerfile: "Dockerfile.goreleaser"
     use: buildx
     build_flag_templates:
-    - "--pull"
-    - "--platform=linux/amd64"
-    - "--label=org.opencontainers.image.created={{.Date}}"
-    - "--label=org.opencontainers.image.title={{.ProjectName}}"
-    - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-    - "--label=org.opencontainers.image.version={{.Version}}"
-    - "--label=org.opencontainers.image.url=https://github.com/joojoooo/{{ .ProjectName }}"
-    - "--label=org.opencontainers.image.source=https://github.com/joojoooo/{{ .ProjectName }}"
+      - "--pull"
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.url=https://github.com/timaschew/{{ .ProjectName }}"
+      - "--label=org.opencontainers.image.source=https://github.com/timaschew/{{ .ProjectName }}"
     extra_files:
-    - config
-    - LICENSE
-  -
-    goos: linux
-    goarch: arm64
-    image_templates:
-    - "ghcr.io/joojoooo/{{.ProjectName}}:{{ .Tag }}-arm64v8"
-    dockerfile: 'Dockerfile.goreleaser'
-    use: buildx
-    build_flag_templates:
-    - "--pull"
-    - "--platform=linux/arm64/v8"
-    - "--label=org.opencontainers.image.created={{.Date}}"
-    - "--label=org.opencontainers.image.title={{.ProjectName}}"
-    - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-    - "--label=org.opencontainers.image.version={{.Version}}"
-    - "--label=org.opencontainers.image.url=https://github.com/joojoooo/{{ .ProjectName }}"
-    - "--label=org.opencontainers.image.source=https://github.com/joojoooo/{{ .ProjectName }}"
-    extra_files:
-    - config
-    - LICENSE
-docker_manifests:
-  - 
-    name_template: ghcr.io/joojoooo/{{ .ProjectName }}:latest
-    image_templates:
-    - ghcr.io/joojoooo/{{ .ProjectName }}:{{ .Tag }}-amd64
-    - ghcr.io/joojoooo/{{ .ProjectName }}:{{ .Tag }}-arm64v8
-  - 
-    name_template: ghcr.io/joojoooo/{{ .ProjectName }}:{{ .Tag }}
-    image_templates:
-    - ghcr.io/joojoooo/{{ .ProjectName }}:{{ .Tag }}-amd64
-    - ghcr.io/joojoooo/{{ .ProjectName }}:{{ .Tag }}-arm64v8
-  - 
-    name_template: ghcr.io/joojoooo/{{.ProjectName}}:v{{ .Major }}
-    image_templates:
-    - ghcr.io/joojoooo/{{ .ProjectName }}:{{ .Tag }}-amd64
-    - ghcr.io/joojoooo/{{ .ProjectName }}:{{ .Tag }}-arm64v8
-  - 
-    name_template: ghcr.io/joojoooo/{{.ProjectName}}:v{{ .Major }}.{{ .Minor }}
-    image_templates:
-    - ghcr.io/joojoooo/{{ .ProjectName }}:{{ .Tag }}-amd64
-    - ghcr.io/joojoooo/{{ .ProjectName }}:{{ .Tag }}-arm64v8
+      - config
+      - LICENSE
+
 archives:
-  - 
-    files:
+  - files:
       - LICENSE*
       - README*
       - CHANGELOG*
@@ -87,24 +46,24 @@ archives:
     name_template: >-
       {{ .ProjectName }}_
       {{- title .Os }}_
-      {{- if eq .Arch "amd64" }}x86_64
-      {{- else if eq .Arch "386" }}i386
-      {{- else }}{{ .Arch }}{{ end }}
-      {{- if .Arm }}v{{ .Arm }}{{ end }}
+      x86_64
     format_overrides:
-    - goos: windows
-      formats: zip
+      - goos: windows
+        formats: zip
 
 checksum:
-  name_template: 'checksums.txt'
+  name_template: "checksums.txt"
+
 snapshot:
   version_template: "{{ incpatch .Version }}-next"
+
 changelog:
   sort: asc
   filters:
     exclude:
-      - '^docs:'
-      - '^test:'
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
 
 # yaml-language-server: $schema=https://goreleaser.com/static/schema.json
-# vim: set ts=2 sw=2 tw=0 fo=cnqoj

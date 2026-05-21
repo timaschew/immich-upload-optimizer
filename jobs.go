@@ -62,16 +62,20 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 	}
 	defer filePart.Close()
 
-	// Check for duplicate job using deviceAssetId before downloading the file
-	jobKey := ""
+	// Check for duplicate job using deviceAssetId+filename before downloading the file.
+	// Filename is included so Live Photo pairs (HEIC + MOV share the same deviceAssetId) aren't treated as duplicates of each other.
+	deviceAssetId := ""
 	if ids, ok := formValues["deviceAssetId"]; ok && len(ids) > 0 {
-		jobKey = ids[0]
+		deviceAssetId = ids[0]
 	}
-	if jobKey == "" {
-		// Never happens, but just in case
-		jobLogger.Print(magenta("no deviceAssetId found in form data, using filename as job key"))
-		jobKey = filePart.FileName()
+	if deviceAssetId == "" {
+		// deviceAssetId is already removed in this PR
+		// https://github.com/immich-app/immich/issues/27818
+		// and marked here to be removed: https://github.com/immich-app/immich/blob/b414b3d32b3952eb6f655d60b91240614be14acc/mobile/lib/services/foreground_upload.service.dart#L323
+		// ToDo: Need to use an alternative, because file name only is not "secure" enough
+		jobLogger.Print(magenta("no deviceAssetId found in form data, using filename only as job key"))
 	}
+	jobKey := deviceAssetId + "|" + filePart.FileName()
 
 	// The iOS app has a bug that randomly stops the 1st upload midway, causing an "unable to save uploaded file: unexpected EOF" error
 	// For this reason, we don't assume a job is a duplicate immediately and instead wait until the full asset is successfully downloaded by the existing job. Not waiting makes the app never upload the asset.

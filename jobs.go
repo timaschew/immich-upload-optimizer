@@ -11,18 +11,33 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 var jobIdCounter atomic.Int64
-var jobs sync.Map // map[string]*jobEntry
+var jobs sync.Map     // map[string]*jobEntry  (key = deviceAssetId + "|" + lowercase-extension)
+var hashJobs sync.Map // map[string]*hashEntry (key = authScope + "|" + sha1, in-flight content dedup)
 
 type jobEntry struct {
 	id           int64
 	downloadDone chan struct{}
 	downloadOK   bool
+}
+
+type hashEntry struct {
+	id          int64
+	processDone chan struct{}
+	processOK   bool
+}
+
+// authScope returns a per-user string built from auth-related request headers,
+// used to scope the in-flight content hash map so two different users uploading
+// the same bytes don't falsely dedup against each other.
+func authScope(r *http.Request) string {
+	return r.Header.Get("x-api-key") + "|" + r.Header.Get("Authorization") + "|" + r.Header.Get("Cookie")
 }
 
 func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error {
@@ -62,8 +77,11 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 	}
 	defer filePart.Close()
 
-	// Check for duplicate job using deviceAssetId+filename before downloading the file.
-	// Filename is included so Live Photo pairs (HEIC + MOV share the same deviceAssetId) aren't treated as duplicates of each other.
+	// Check for duplicate job using deviceAssetId + lowercase file extension before downloading the file.
+	// The extension (not the full filename) is used so that:
+	//   1. Live Photo pairs (HEIC + MOV share the same deviceAssetId) aren't treated as duplicates of each other — the two halves have different extensions.
+	//   2. The same asset uploaded via different iOS paths (foreground vs. background_downloader) IS treated as a duplicate, even though the multipart filenames differ ("IMG_X.MOV" vs. "<localId>_<ts>_o_IMG_X.MOV").
+	// A second post-download safety net using the content SHA1 catches the rare cases where this pre-download key is not enough (different deviceAssetId, same bytes).
 	deviceAssetId := ""
 	if ids, ok := formValues["deviceAssetId"]; ok && len(ids) > 0 {
 		deviceAssetId = ids[0]
@@ -75,7 +93,7 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 		// ToDo: Need to use an alternative, because file name only is not "secure" enough
 		jobLogger.Print(magenta("no deviceAssetId found in form data, using filename only as job key"))
 	}
-	jobKey := deviceAssetId + "|" + filePart.FileName()
+	jobKey := deviceAssetId + "|" + strings.ToLower(path.Ext(filePart.FileName()))
 
 	// The iOS app has a bug that randomly stops the 1st upload midway, causing an "unable to save uploaded file: unexpected EOF" error
 	// For this reason, we don't assume a job is a duplicate immediately and instead wait until the full asset is successfully downloaded by the existing job. Not waiting makes the app never upload the asset.
@@ -194,6 +212,51 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 		}
 	}
 
+	// Post-download safety net: dedup by content hash (per-user-scoped).
+	// Catches cases the pre-download key misses: e.g. the same bytes uploaded twice with a
+	// different deviceAssetId, or the same deviceAssetId where the extension happens to match
+	// a different in-flight file (rare). Avoids the Immich UQ_assets_owner_checksum constraint
+	// failure and the orphaned files in upload/ that follow it.
+	hashKey := authScope(r) + "|" + originalHash
+	hashEntryNew := &hashEntry{id: jobID, processDone: make(chan struct{})}
+	for {
+		existing, loaded := hashJobs.LoadOrStore(hashKey, hashEntryNew)
+		if !loaded {
+			break
+		}
+		existingHashEntry := existing.(*hashEntry)
+		jobLogger.Print(yellow("waiting for job %d to finish processing (same content hash)", existingHashEntry.id))
+		select {
+		case <-existingHashEntry.processDone:
+		case <-r.Context().Done():
+			return fmt.Errorf("job %d: request cancelled while waiting for duplicate hash job", jobID)
+		}
+		if existingHashEntry.processOK {
+			// Existing job already uploaded the same content. Hijack the connection like the pre-download dedup does.
+			if hj, ok := w.(http.Hijacker); ok {
+				conn, bufrw, err := hj.Hijack()
+				if err == nil {
+					_, _ = bufrw.WriteString("HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nIUO already processed an asset with the same content\r\n")
+					_ = bufrw.Flush()
+					if tcpConn, ok := conn.(*net.TCPConn); ok {
+						tcpConn.CloseWrite()
+						tcpConn.SetReadDeadline(time.Now().Add(time.Millisecond * 250))
+						io.Copy(io.Discard, tcpConn)
+					}
+					conn.Close()
+				}
+			}
+			return fmt.Errorf("job %d: job %d already processed an asset with the same content hash", jobID, existingHashEntry.id)
+		}
+		jobLogger.Print(yellow("job %d hash processing failed, retrying", existingHashEntry.id))
+	}
+	defer func() {
+		hashJobs.Delete(hashKey)
+		if !hashEntryNew.processOK {
+			close(hashEntryNew.processDone)
+		}
+	}()
+
 	if _, err = tmpFile.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("job %d: unable to seek temp file: %w", jobID, err)
 	}
@@ -234,6 +297,9 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 			return fmt.Errorf("job %d: new sha1: %w", jobID, err)
 		}
 	}
+
+	hashEntryNew.processOK = true
+	close(hashEntryNew.processDone)
 
 	return nil
 }

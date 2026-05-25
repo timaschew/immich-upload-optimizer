@@ -101,14 +101,6 @@ func (tp *TaskProcessor) CleanWorkDir() error {
 }
 
 func (tp *TaskProcessor) Run() error {
-	// Limit the number of concurrent tasks running
-	if slices.Contains(imageExtensions, strings.ToLower(strings.TrimPrefix(tp.OriginalExtension, "."))) {
-		imageSemaphore <- struct{}{}
-		defer func() { <-imageSemaphore }()
-	} else {
-		videoSemaphore <- struct{}{}
-		defer func() { <-videoSemaphore }()
-	}
 	var err error
 
 	tp.tempWorkDir, err = os.MkdirTemp("", "processing-*")

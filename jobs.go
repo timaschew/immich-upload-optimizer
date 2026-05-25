@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -146,8 +147,34 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 		}
 	}()
 
-	// Download original file
+	// Acquire a processing slot BEFORE touching tmpfs. This bounds the number of
+	// files simultaneously occupying TMPDIR to max_image_jobs+max_video_jobs.
+	// Without this gate the iOS app's parallel upload connections each write
+	// their full payload to tmpfs and only then wait for a worker slot, which
+	// during bulk uploads filled the 4 GB tmpfs and produced ENOSPC errors.
+	// The iOS client pauses transmission via TCP backpressure while we don't
+	// read from the connection, so no bandwidth is wasted.
 	fileName := filePart.FileName()
+	ext := strings.ToLower(strings.TrimPrefix(path.Ext(fileName), "."))
+	sem := videoSemaphore
+	semName := "video"
+	if slices.Contains(imageExtensions, ext) {
+		sem = imageSemaphore
+		semName = "image"
+	}
+	select {
+	case sem <- struct{}{}:
+	default:
+		jobLogger.Print(yellow("waiting for free %s slot", semName))
+		select {
+		case sem <- struct{}{}:
+		case <-r.Context().Done():
+			return fmt.Errorf("job %d: request cancelled while waiting for %s slot", jobID, semName)
+		}
+	}
+	defer func() { <-sem }()
+
+	// Download original file
 	tmpFile, err := os.CreateTemp("", "upload-*"+path.Ext(fileName))
 	if err != nil {
 		return fmt.Errorf("job %d: unable to create temp file: %w", jobID, err)

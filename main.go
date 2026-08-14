@@ -40,11 +40,14 @@ var configFile string
 var checksumsFile string
 var downloadJpgFromJxl bool
 var downloadJpgFromAvif bool
+var motionPhotoSplit bool
 var forceColors bool
 
 var config *Config
 
-func init() {
+// setup is called at the start of main instead of from init, so that the test binary doesn't run into
+// flag.Parse on the -test.* flags.
+func setup() {
 	viper.SetEnvPrefix("iuo")
 	viper.AutomaticEnv()
 	viper.BindEnv("upstream")
@@ -52,6 +55,7 @@ func init() {
 	viper.BindEnv("tasks_file")
 	viper.BindEnv("download_jpg_from_jxl")
 	viper.BindEnv("download_jpg_from_avif")
+	viper.BindEnv("motion_photo_split")
 	viper.BindEnv("max_image_jobs")
 	viper.BindEnv("max_video_jobs")
 	viper.BindEnv("force_colors")
@@ -62,6 +66,7 @@ func init() {
 	viper.SetDefault("checksums_file", "checksums.csv")
 	viper.SetDefault("download_jpg_from_jxl", false)
 	viper.SetDefault("download_jpg_from_avif", false)
+	viper.SetDefault("motion_photo_split", true)
 	viper.SetDefault("max_image_jobs", 5)
 	viper.SetDefault("max_video_jobs", 1)
 	viper.SetDefault("force_colors", true)
@@ -73,6 +78,7 @@ func init() {
 	flag.StringVar(&checksumsFile, "checksums_file", viper.GetString("checksums_file"), "Path to the checksums file")
 	flag.BoolVar(&downloadJpgFromJxl, "download_jpg_from_jxl", viper.GetBool("download_jpg_from_jxl"), "Converts JXL images to JPG on download for wider compatibility")
 	flag.BoolVar(&downloadJpgFromAvif, "download_jpg_from_avif", viper.GetBool("download_jpg_from_avif"), "Converts AVIF images to JPG on download for wider compatibility")
+	flag.BoolVar(&motionPhotoSplit, "motion_photo_split", viper.GetBool("motion_photo_split"), "Split Android motion photos into a still image and a linked video asset")
 	flag.UintVar(&maxImageJobs, "max_image_jobs", viper.GetUint("max_image_jobs"), "Max number of image jobs running concurrently")
 	flag.UintVar(&maxVideoJobs, "max_video_jobs", viper.GetUint("max_video_jobs"), "Max number of video jobs running concurrently")
 	flag.BoolVar(&forceColors, "force_colors", viper.GetBool("force_colors"), "Force colored output even in non-TTY environments like Docker")
@@ -102,6 +108,7 @@ var proxy *httputil.ReverseProxy
 var DevMITMproxy = version == "dev"
 
 func main() {
+	setup()
 	baseLogger = log.New(os.Stdout, "", log.Ldate|log.Ltime)
 	log.Print(green("Starting %s on %s...", printVersion(), listenAddr))
 	tmpDir := os.Getenv("TMPDIR")

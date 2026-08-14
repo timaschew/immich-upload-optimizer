@@ -23,6 +23,8 @@ Features that differentiate this fork from the original project:
   - Doesn't show duplicate assets on the mobile app
   - Replaces checksums and file names, making the app oblivious to the different file being uploaded
   - The app won't try to upload the same files again because of checksum mismatch, even if you reinstall
+- **Android motion photos**
+  - Splits `.MP.jpg` into a still image and a video asset, so the motion survives the conversion
 - **AVIF support**
   - A more compatible open image format with similar quality/size to JXL
 - **Automatic JXL/AVIF to JPG conversion**
@@ -82,6 +84,7 @@ All flags are also available as environment variables using the prefix `IUO_` fo
 - `-checksums_file`: Path to the checksums file (default: `checksums.csv`)
 - `-download_jpg_from_jxl`: Converts JXL images to JPG on download for compatibility (default: `false`)
 - `-download_jpg_from_avif`: Converts AVIF images to JPG on download for compatibility (default: `false`)
+- `-motion_photo_split`: Split Android motion photos into a still image and a linked video asset (default: `true`)
 - `-max_image_jobs`: Max number of image jobs running concurrently (default: `5`)
 - `-max_video_jobs`: Max number of video jobs running concurrently (default: `1`)
 - `-force_colors`: Force colored log output even in non-TTY environments like Docker (default: `true`)
@@ -103,6 +106,18 @@ If neither fits your needs, create your own conversion task: examples in [config
 
 > [!NOTE]
 > Don't judge image compression artifacts by looking at the [Immich](https://github.com/immich-app/immich) low quality preview, zoom the image or download it and use an external viewer (Zooming on the Immich viewer will load the original image only if your browser is compatible with the format)
+
+## Android motion photos
+Android motion photos (`.MP.jpg`) are a JPEG with the video appended to it, so converting them would silently drop the video while the metadata keeps claiming it is there, which makes the Immich server read garbage at the offset it computes from that metadata.
+
+IUO splits them before any task runs:
+- the still image keeps its `.jpg` extension and goes through your image task, the video gets `.mp4` and goes through your video task, so quality is configured the same way as for any other file
+- both are uploaded as two assets linked through `livePhotoVideoId`, the same way the mobile app uploads an iOS live photo, and the video asset is hidden from the timeline
+- the still image keeps the HDR gain map, and its motion photo flag is cleared so the server doesn't look for a video that is no longer in the file
+
+Since a motion photo produces a video job for every photo taken, watch `-max_video_jobs` and consider a `min_filesize` on your video task to skip the short clips.
+
+Samsung motion photos in HEIC containers are not covered: they store the video as an exif binary tag instead of appending it. Use `-motion_photo_split=false` to disable the whole feature.
 
 ## 🎬 Videos
 Lossy **[H.265](wikipedia.org/wiki/High_Efficiency_Video_Coding)** CRF23 60fps is used by default to ensure storage savings even for short videos while maintaining the same perceived quality.

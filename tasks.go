@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -62,6 +63,26 @@ func NewTaskProcessor(file *os.File, fileName string, fileSize int64, logger *cu
 		tempOriginalFilePath: file.Name(),
 		logger:               logger,
 	}, nil
+}
+
+// runTask processes file with the task configured for its extension and reports which file should be uploaded:
+// the processed one, or the original when processing didn't make it any smaller. A file without a matching task
+// is passed through untouched.
+// The returned TaskProcessor is nil when no task ran, otherwise the caller owns it and must Close it.
+func runTask(file *os.File, name string, size int64, logger *customLogger) (upload io.ReadSeeker, uploadName string, tp *TaskProcessor, converted bool, err error) {
+	tp, err = NewTaskProcessor(file, name, size, logger)
+	if err != nil || tp == nil {
+		return file, name, nil, false, nil
+	}
+	if err = tp.Run(); err != nil {
+		return nil, "", tp, false, err
+	}
+	if tp.OriginalSize <= tp.ProcessedSize {
+		_ = tp.CleanWorkDir() // Save RAM before upload (tmpfs)
+		return tp.OriginalFile, name, tp, false, nil
+	}
+	_ = tp.CleanOriginalFile() // Save RAM before upload (tmpfs)
+	return tp.ProcessedFile, tp.ProcessedFilename, tp, true, nil
 }
 
 func (tp *TaskProcessor) Close() error {

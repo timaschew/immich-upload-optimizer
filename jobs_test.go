@@ -22,12 +22,43 @@ type receivedUpload struct {
 	fields   map[string]string
 	filename string
 	size     int64
+	checksum string
+}
+
+// stubDuplicateAssetID makes the upstream stub answer bulk-upload-check with a rejection carrying this id,
+// as immich does for content the user already owns. Empty means every checksum is new.
+var stubDuplicateAssetID string
+
+// answerBulkUploadCheck replies to the duplicate check IUO runs before every upload.
+func answerBulkUploadCheck(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	var request bulkUploadCheckRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		t.Errorf("decode bulk-upload-check body: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	response := bulkUploadCheckResponse{}
+	for _, asset := range request.Assets {
+		result := bulkUploadCheckResult{ID: asset.ID, Action: "accept"}
+		if stubDuplicateAssetID != "" {
+			result.Action = "reject"
+			result.AssetID = stubDuplicateAssetID
+		}
+		response.Results = append(response.Results, result)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 // stubUpstream stands in for the immich server and answers uploads with a new asset id.
 func stubUpstream(t *testing.T, uploads *[]receivedUpload) {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/assets/bulk-upload-check" {
+			answerBulkUploadCheck(t, w, r)
+			return
+		}
 		if r.URL.Path != "/api/assets" || r.Method != "POST" {
 			t.Errorf("unexpected upstream request: %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -38,7 +69,7 @@ func stubUpstream(t *testing.T, uploads *[]receivedUpload) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		upload := receivedUpload{fields: map[string]string{}}
+		upload := receivedUpload{fields: map[string]string{}, checksum: r.Header.Get(checksumHeader)}
 		for key, values := range r.MultipartForm.Value {
 			upload.fields[key] = values[0]
 		}
@@ -68,6 +99,7 @@ func prepareJobEnv(t *testing.T) {
 	t.Helper()
 	DevMITMproxy = false
 	motionPhotoSplit = true
+	stubDuplicateAssetID = ""
 	config = &Config{}
 	imageSemaphore = make(chan struct{}, 1)
 	videoSemaphore = make(chan struct{}, 1)
@@ -82,12 +114,17 @@ func prepareJobEnv(t *testing.T) {
 // uploadRequest builds the multipart request the immich mobile app sends for one asset.
 func uploadRequest(t *testing.T, path string) *http.Request {
 	t.Helper()
-	file, err := os.Open(path)
+	content, err := os.ReadFile(path)
 	if err != nil {
 		t.Skipf("sample not available: %v", err)
 	}
-	defer file.Close()
+	return uploadRequestFor(t, filepath.Base(path), filepath.Base(path), content)
+}
 
+// uploadRequestFor builds the same request with partName in the file part header and declaredName in the
+// "filename" field. Those two differ on the iOS background path, which sends the PhotoKit temp basename.
+func uploadRequestFor(t *testing.T, partName, declaredName string, content []byte) *http.Request {
+	t.Helper()
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	for key, value := range map[string]string{
@@ -97,18 +134,18 @@ func uploadRequest(t *testing.T, path string) *http.Request {
 		"fileModifiedAt": "2026-08-07T07:39:05.000Z",
 		"isFavorite":     "false",
 		"duration":       "0",
-		"filename":       filepath.Base(path),
+		"filename":       declaredName,
 	} {
-		if err = writer.WriteField(key, value); err != nil {
+		if err := writer.WriteField(key, value); err != nil {
 			t.Fatalf("write field %s: %v", key, err)
 		}
 	}
-	part, err := writer.CreateFormFile("assetData", filepath.Base(path))
+	part, err := writer.CreateFormFile("assetData", partName)
 	if err != nil {
 		t.Fatalf("create form file: %v", err)
 	}
-	if _, err = io.Copy(part, file); err != nil {
-		t.Fatalf("copy sample: %v", err)
+	if _, err = part.Write(content); err != nil {
+		t.Fatalf("write sample: %v", err)
 	}
 	if err = writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
@@ -217,6 +254,10 @@ func TestNewJobRemovesVideoWhenStillFails(t *testing.T) {
 	var deleted []string
 	uploads := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/assets/bulk-upload-check" {
+			answerBulkUploadCheck(t, w, r)
+			return
+		}
 		switch r.Method {
 		case "POST":
 			uploads++
@@ -262,6 +303,93 @@ func TestNewJobRemovesVideoWhenStillFails(t *testing.T) {
 	defer mapLock.RUnlock()
 	if len(originalToFakeChecksum) != 0 {
 		t.Errorf("a rejected upload registered a checksum mapping: %v", originalToFakeChecksum)
+	}
+}
+
+// An asset immich already holds must not be uploaded again, even when IUO has no task for it and so no
+// checksum mapping to recognise it by. That is the case the iOS retry loop kept hitting: every attempt
+// after the first job had finished reached immich and failed on UQ_assets_owner_checksum.
+func TestNewJobSkipsAssetAlreadyOnServer(t *testing.T) {
+	prepareJobEnv(t)
+	var uploads []receivedUpload
+	stubUpstream(t, &uploads)
+	stubDuplicateAssetID = "existing-asset-id"
+
+	request := uploadRequestFor(t, "A84B87EA_L0_001_1762107742_o_IMG_20250417_175401806.avif",
+		"IMG_20250417_175401806.avif", []byte("bytes immich already has"))
+	recorder := httptest.NewRecorder()
+	if err := newJob(request, recorder, newCustomLogger(baseLogger, "")); err != nil {
+		t.Fatalf("newJob: %v", err)
+	}
+
+	if len(uploads) != 0 {
+		t.Errorf("the duplicate reached immich: %d uploads", len(uploads))
+	}
+	if recorder.Code != http.StatusOK {
+		t.Errorf("client got status %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var answer assetMediaResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &answer); err != nil {
+		t.Fatalf("decode client answer %q: %v", recorder.Body.String(), err)
+	}
+	if answer.Status != "duplicate" || answer.ID != "existing-asset-id" {
+		t.Errorf("client got %+v, want the duplicate id immich reported", answer)
+	}
+}
+
+// Every upload carries the checksum of the bytes going out, which immich looks up before it stores
+// anything. It is the last guard against a duplicate that slipped past the check above.
+func TestNewJobSendsChecksumWithUpload(t *testing.T) {
+	prepareJobEnv(t)
+	var uploads []receivedUpload
+	stubUpstream(t, &uploads)
+
+	content := []byte("brand new asset")
+	request := uploadRequestFor(t, "5409A9BC_L0_001_1785358813_o_IMG_2706.MOV", "IMG_2706.MOV", content)
+	if err := newJob(request, httptest.NewRecorder(), newCustomLogger(baseLogger, "")); err != nil {
+		t.Fatalf("newJob: %v", err)
+	}
+
+	if len(uploads) != 1 {
+		t.Fatalf("got %d uploads, want 1", len(uploads))
+	}
+	want, err := SHA1(bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("SHA1: %v", err)
+	}
+	if uploads[0].checksum != want {
+		t.Errorf("%s = %q, want %q", checksumHeader, uploads[0].checksum, want)
+	}
+	// What immich stores is the name the client declared, not the PhotoKit temp name of the background path
+	if uploads[0].filename != "IMG_2706.MOV" {
+		t.Errorf("uploaded filename = %q, want %q", uploads[0].filename, "IMG_2706.MOV")
+	}
+}
+
+// The duplicate check is a safety net, not a gate: when immich cannot answer it, the upload still goes
+// through and immich decides, exactly as it did before the check existed.
+func TestNewJobUploadsWhenDuplicateCheckFails(t *testing.T) {
+	prepareJobEnv(t)
+	var uploads []receivedUpload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/assets/bulk-upload-check" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		uploads = append(uploads, receivedUpload{})
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(assetMediaResponse{ID: "asset-a", Status: "created"})
+	}))
+	t.Cleanup(server.Close)
+	upstreamURL = server.URL
+
+	request := uploadRequestFor(t, "IMG_2706.MOV", "IMG_2706.MOV", []byte("the check is down"))
+	if err := newJob(request, httptest.NewRecorder(), newCustomLogger(baseLogger, "")); err != nil {
+		t.Fatalf("newJob: %v", err)
+	}
+	if len(uploads) != 1 {
+		t.Errorf("got %d uploads, want the asset to go through anyway", len(uploads))
 	}
 }
 

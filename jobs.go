@@ -13,11 +13,16 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// checksumHeader carries the SHA-1 of an upload. immich looks it up before it stores anything and
+// answers a known one with 200 duplicate (server/src/middleware/asset-upload.interceptor.ts).
+const checksumHeader = "x-immich-checksum"
 
 var jobIdCounter atomic.Int64
 var jobs sync.Map     // map[string]*inflightEntry (key = deviceAssetId + "|" + lowercase-original-filename, only populated when the client sends a deviceAssetId)
@@ -25,10 +30,20 @@ var hashJobs sync.Map // map[string]*inflightEntry (key = authScope + "|" + sha1
 
 // inflightEntry lets other requests for the same asset wait until this job reaches its checkpoint:
 // the finished download for the pre-download map, the finished upload for the content hash map.
+// assetID is the id immich answered with, known only at the second checkpoint. Both fields are
+// written before done is closed and read after, so the close orders the access.
 type inflightEntry struct {
-	id   int64
-	done chan struct{}
-	ok   bool
+	id      int64
+	done    chan struct{}
+	ok      bool
+	assetID string
+}
+
+// uploadResult describes what happened to an asset that was sent upstream.
+type uploadResult struct {
+	status   int    // status code immich answered with, 0 when the upload never made it there
+	assetID  string // id immich assigned, or the id of the existing asset when it answered "duplicate"
+	checksum string // SHA-1 of the bytes that were uploaded
 }
 
 // authScope returns a fingerprint of the request's credentials, used to scope the in-flight content
@@ -68,6 +83,45 @@ func reject409(w http.ResponseWriter, message string) {
 		io.Copy(io.Discard, tcpConn)
 	}
 	conn.Close()
+}
+
+// respondDuplicate answers the way immich answers a duplicate upload: 200 with the id of the asset
+// that already holds these bytes. Clients read that as "backed up" instead of as a failed upload.
+func respondDuplicate(w http.ResponseWriter, assetID string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(assetMediaResponse{ID: assetID, Status: "duplicate"})
+}
+
+// upstreamAssetID asks immich whether the user already owns an asset with this SHA-1 and returns its
+// id, or "" when the asset is new. A failed check returns "" as well: the upload then goes ahead and
+// immich decides, which is what happened before this check existed.
+func upstreamAssetID(r *http.Request, checksum string, jobID int64) string {
+	id := fmt.Sprintf("job%d", jobID)
+	body, err := json.Marshal(bulkUploadCheckRequest{Assets: []bulkUploadCheckItem{{ID: id, Checksum: checksum}}})
+	if err != nil {
+		return ""
+	}
+	req, err := http.NewRequest("POST", upstreamURL+"/api/assets/bulk-upload-check", bytes.NewReader(body))
+	if err != nil {
+		return ""
+	}
+	req.Header = r.Header.Clone()
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Del("Content-Length")
+	resp, err := getHTTPclient().Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var checkResp bulkUploadCheckResponse
+	if err := json.NewDecoder(resp.Body).Decode(&checkResp); err != nil {
+		return ""
+	}
+	if len(checkResp.Results) == 0 || checkResp.Results[0].ID != id || checkResp.Results[0].Action != "reject" {
+		return ""
+	}
+	return checkResp.Results[0].AssetID
 }
 
 func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error {
@@ -216,37 +270,31 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 		}
 	}
 
-	// Skip this asset if the optimized version is already on the Immich server.
-	// This is a safety net to guarantee no duplicate ever reaches the server if clients fail to check themselves before uploading.
+	// Skip this asset if it is already on the immich server: the optimized version when this original
+	// was converted before, the original itself otherwise.
+	// The check runs for every upload, not only for known conversions. What IUO passes through
+	// unchanged - no task for the extension, or a conversion that came out bigger than the original -
+	// never gets a checksum mapping, so without this it had no duplicate protection at all beyond the
+	// lifetime of the first job. Every client retry after that job finished then reached immich, failed
+	// on UQ_assets_owner_checksum and left an orphan behind in upload/.
 	originalHash := ""
 	if originalHash, err = SHA1(tmpFile); err != nil {
 		return fmt.Errorf("job %d: sha1 original: %w", jobID, err)
 	}
 	mapLock.RLock()
-	fakeHash, hasFake := originalToFakeChecksum[originalHash]
+	knownHash, isConverted := originalToFakeChecksum[originalHash]
 	mapLock.RUnlock()
-	if hasFake {
-		checkBody, _ := json.Marshal(bulkUploadCheckRequest{Assets: []bulkUploadCheckItem{{ID: fmt.Sprintf("job%d", jobID), Checksum: fakeHash}}})
-		checkReq, err := http.NewRequest("POST", upstreamURL+"/api/assets/bulk-upload-check", bytes.NewReader(checkBody))
-		if err == nil {
-			checkReq.Header = r.Header.Clone()
-			checkReq.Header.Set("Content-Type", "application/json")
-			resp, err := getHTTPclient().Do(checkReq)
-			if err == nil {
-				var checkResp bulkUploadCheckResponse
-				if err := json.NewDecoder(resp.Body).Decode(&checkResp); err == nil {
-					if len(checkResp.Results) > 0 && checkResp.Results[0].Action == "reject" && checkResp.Results[0].ID == fmt.Sprintf("job%d", jobID) {
-						resp.Body.Close()
-						jobLogger.Print(yellow("skipped:") + " \"" + white(fileName) + "\" " + yellow("(optimized version already on the immich server)"))
-						w.Header().Set("Content-Type", "application/json")
-						w.WriteHeader(http.StatusOK)
-						json.NewEncoder(w).Encode(assetMediaResponse{ID: checkResp.Results[0].AssetID, Status: "duplicate"})
-						return nil
-					}
-				}
-				resp.Body.Close()
-			}
+	if !isConverted {
+		knownHash = originalHash
+	}
+	if assetID := upstreamAssetID(r, knownHash, jobID); assetID != "" {
+		if isConverted {
+			jobLogger.Print(yellow("skipped:") + " \"" + white(fileName) + "\" " + yellow("(optimized version already on the immich server)"))
+		} else {
+			jobLogger.Print(yellow("skipped:") + " \"" + white(fileName) + "\" " + yellow("(already on the immich server)"))
 		}
+		respondDuplicate(w, assetID)
+		return nil
 	}
 
 	// Post-download safety net: dedup by content hash (per-user-scoped).
@@ -273,7 +321,13 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 			}
 		}
 		if existingHashEntry.ok {
-			// Existing job already uploaded the same content
+			// Existing job already uploaded the same content. Its asset id makes this a duplicate
+			// answer instead of an error, which is what immich would have replied to this upload.
+			if existingHashEntry.assetID != "" {
+				jobLogger.Print(yellow("skipped:") + " \"" + white(fileName) + "\" " + yellow("(job %d uploaded the same content)", existingHashEntry.id))
+				respondDuplicate(w, existingHashEntry.assetID)
+				return nil
+			}
 			reject409(w, "IUO already processed an asset with the same content")
 			return fmt.Errorf("job %d: job %d already processed an asset with the same content hash", jobID, existingHashEntry.id)
 		}
@@ -354,36 +408,29 @@ func newJob(r *http.Request, w http.ResponseWriter, logger *customLogger) error 
 		extra["livePhotoVideoId"] = motionVideoID
 	}
 	// Upload the original file or processed one if a task was found
-	status, err := uploadUpstream(w, r, uploadFile, uploadFilename, formValues, extra, jobLogger)
+	upload, err := uploadUpstream(w, r, uploadFile, uploadFilename, formValues, extra, jobLogger)
 	if err != nil {
 		cleanupMotionVideo()
 		http.Error(w, "failed to process file, view IUO logs for more info", http.StatusConflict)
 		return fmt.Errorf("job %d: upload upstream: %w", jobID, err)
 	}
-	if status >= 400 {
+	if upload.status >= 400 {
 		cleanupMotionVideo()
-		return fmt.Errorf("job %d: immich rejected the upload with status %d", jobID, status)
+		return fmt.Errorf("job %d: immich rejected the upload with status %d", jobID, upload.status)
 	}
 	if converted {
-		newHash, hashErr := SHA1(taskProcessor.ProcessedFile)
-		if hashErr != nil {
-			return fmt.Errorf("job %d: new sha1: %w", jobID, hashErr)
-		}
-		addChecksums(newHash, originalHash)
+		addChecksums(upload.checksum, originalHash)
 		jobLogger.Print(greenBold("uploaded:") + " \"" + white(taskProcessor.ProcessedFilename) + "\" " + greenBold("(%s) <- (%s)", humanReadableSize(taskProcessor.ProcessedSize), humanReadableSize(taskProcessor.OriginalSize)) + " \"" + white(taskProcessor.OriginalFilename) + "\"")
 	} else {
 		if motionSplit {
 			// The client knows the checksum of the whole .MP.jpg only. Without a mapping to the still image
 			// its bulk-upload-check never matches and the photo is uploaded again on every sync.
-			stillHash, hashErr := SHA1(uploadFile)
-			if hashErr != nil {
-				return fmt.Errorf("job %d: still sha1: %w", jobID, hashErr)
-			}
-			addChecksums(stillHash, originalHash)
+			addChecksums(upload.checksum, originalHash)
 		}
 		jobLogger.Print(greenBold("uploaded original:") + " \"" + white(fileName) + "\" " + greenBold("(%s)", humanReadableSize(fileSize)))
 	}
 
+	hashEntry.assetID = upload.assetID
 	hashEntry.ok = true
 	close(hashEntry.done)
 
@@ -416,7 +463,15 @@ func processMotionVideo(r *http.Request, videoFile *os.File, name string, size i
 
 // postAsset uploads a file to the upstream /api/assets endpoint, reusing the form fields the client sent.
 // Fields in extra are added to the request and take precedence over the client's values.
-func postAsset(r *http.Request, file io.ReadSeeker, name string, formValues map[string][]string, extra map[string]string) (resp *http.Response, err error) {
+// It returns the SHA-1 of the uploaded bytes along with the response.
+func postAsset(r *http.Request, file io.ReadSeeker, name string, formValues map[string][]string, extra map[string]string) (resp *http.Response, checksum string, err error) {
+	// immich answers a checksum it already knows with 200 duplicate before multer writes anything to
+	// disk (AssetUploadInterceptor runs ahead of FileUploadInterceptor), so this is both an upload
+	// saved and the last guard against a racing duplicate hitting UQ_assets_owner_checksum and
+	// orphaning a file in upload/. Hashing happens before the goroutine below, which seeks the file.
+	if checksum, err = SHA1(file); err != nil {
+		return nil, "", fmt.Errorf("unable to hash file: %w", err)
+	}
 	pipeReader, pipeWriter := io.Pipe()
 	defer pipeReader.Close()
 	multipartWriter := multipart.NewWriter(pipeWriter)
@@ -477,41 +532,57 @@ func postAsset(r *http.Request, file io.ReadSeeker, name string, formValues map[
 	}()
 	req, err := http.NewRequestWithContext(ctx, "POST", upstreamURL+r.URL.String(), pipeReader)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create POST request: %w", err)
+		return nil, "", fmt.Errorf("unable to create POST request: %w", err)
 	}
 	req.Header = r.Header.Clone()
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	// Overwrites the client's header, which describes the bytes it sent rather than the ones going out here
+	req.Header.Set(checksumHeader, checksum)
 	// Send the request to the upstream server
 	resp, err = getHTTPclient().Do(req)
 	if err != nil {
 		select {
 		case chErr := <-errChan:
 			if chErr != nil {
-				return nil, fmt.Errorf("error writing data to pipe: %v: %v", err, chErr)
+				return nil, "", fmt.Errorf("error writing data to pipe: %v: %v", err, chErr)
 			}
 		default:
 		}
-		return nil, fmt.Errorf("unable to POST: %w", err)
+		return nil, "", fmt.Errorf("unable to POST: %w", err)
 	}
-	return resp, nil
+	return resp, checksum, nil
 }
 
-// uploadUpstream uploads the asset and forwards the immich response to the client. It returns the status code
-// immich answered with, or 0 when the upload never made it there. A failure to forward the response to the
-// client is logged but not returned: the asset is on the server at that point.
-func uploadUpstream(w http.ResponseWriter, r *http.Request, file io.ReadSeeker, name string, formValues map[string][]string, extra map[string]string, logger *customLogger) (status int, err error) {
-	resp, err := postAsset(r, file, name, formValues, extra)
+// uploadUpstream uploads the asset and forwards the immich response to the client. A failure to forward
+// the response to the client is logged but not returned: the asset is on the server at that point.
+func uploadUpstream(w http.ResponseWriter, r *http.Request, file io.ReadSeeker, name string, formValues map[string][]string, extra map[string]string, logger *customLogger) (uploadResult, error) {
+	resp, checksum, err := postAsset(r, file, name, formValues, extra)
 	if err != nil {
-		return 0, err
+		return uploadResult{}, err
 	}
 	defer resp.Body.Close()
+	result := uploadResult{status: resp.StatusCode, checksum: checksum}
+	// The answer is a small json object ({"id":…,"status":…}). Reading it whole instead of streaming it
+	// through keeps the asset id, which lets a job waiting on the same content hash answer with a
+	// duplicate of its own instead of failing its client with a 409.
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		logger.Print(red("unable to read the immich response: %v", readErr))
+	}
+	var media assetMediaResponse
+	if json.Unmarshal(body, &media) == nil {
+		result.assetID = media.ID
+	}
 	// Send immich response back to client
 	setHeaders(w.Header(), resp.Header)
+	// The body is in memory now, so announce what is actually being written rather than what immich
+	// announced: a read that stopped short would otherwise leave the client waiting for the rest.
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(resp.StatusCode)
-	if _, err = io.Copy(w, resp.Body); err != nil {
-		logger.Print(red("unable to forward response to client: %v", err))
+	if _, writeErr := w.Write(body); writeErr != nil {
+		logger.Print(red("unable to forward response to client: %v", writeErr))
 	}
-	return resp.StatusCode, nil
+	return result, nil
 }
 
 // uploadMotionVideo uploads the video extracted from a motion photo as its own asset and returns its id, so the
@@ -527,7 +598,7 @@ func uploadMotionVideo(r *http.Request, file io.ReadSeeker, name string, formVal
 		}
 		fields[key] = values
 	}
-	resp, err := postAsset(r, file, name, fields, map[string]string{"visibility": "hidden"})
+	resp, _, err := postAsset(r, file, name, fields, map[string]string{"visibility": "hidden"})
 	if err != nil {
 		return "", err
 	}
